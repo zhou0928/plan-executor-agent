@@ -21,15 +21,17 @@ from typing import Any
 from dify_plugin.core.runtime import Session
 from dify_plugin.entities.agent import AgentInvokeMessage
 from dify_plugin.entities.model.message import (
+    AssistantPromptMessage,
     ImagePromptMessageContent,
-    PromptMessageTool,
+    PromptMessageRole,
     SystemPromptMessage,
     TextPromptMessageContent,
+    ToolPromptMessage,
     UserPromptMessage,
 )
 from dify_plugin.entities.tool import ToolInvokeMessage
 from dify_plugin.file.file import File, FileType
-from dify_plugin.interfaces.agent import AgentStrategy
+from dify_plugin.interfaces.agent import AgentStrategy, ToolEntity
 
 from core.execution_metadata import ExecutionMetadata
 from core.executor import ExecutionOutcome, Executor
@@ -70,6 +72,22 @@ def _flatten_content(content: Any) -> str:
     return "".join(getattr(part, "data", "") or "" for part in content)
 
 
+def _coerce_history_message(raw: dict[str, Any]) -> Any:
+    """Lift a history dict (role/content) into its SDK PromptMessage subclass.
+
+    Mirrors AgentModelConfig.convert_prompt_messages; unknown roles fall back
+    to UserPromptMessage so a bad turn can't crash the whole step.
+    """
+    role = raw.get("role")
+    if role == PromptMessageRole.ASSISTANT.value:
+        return AssistantPromptMessage(**raw)
+    if role == PromptMessageRole.SYSTEM.value:
+        return SystemPromptMessage(**raw)
+    if role == PromptMessageRole.TOOL.value:
+        return ToolPromptMessage(**raw)
+    return UserPromptMessage(**raw)
+
+
 def _chunk_text(chunk: Any) -> str:
     delta = getattr(chunk, "delta", None)
     if delta is None:
@@ -80,7 +98,7 @@ def _chunk_text(chunk: Any) -> str:
 def _plan_with_validation(
     planner: Planner,
     goal: str,
-    tools: list[PromptMessageTool],
+    tools: list[ToolEntity],
     instruction: str,
     initial_vars: set[str],
     budget: int,
@@ -105,24 +123,27 @@ def _plan_with_validation(
 
 
 def _render_tool_message(message: Any) -> str:
-    """Render any ToolInvokeMessage variant to text without repr()ing blobs.
+    """Render one ToolInvokeMessage to text without repr()ing blobs.
 
-    Messages arriving for non-TEXT/JSON types carry binary data; repr()ing the
-    whole object would dump raw base64 into the answer, so unknown types get a
-    terse ``[label] url`` instead.
+    ``message`` is the SDK wrapper: the type sits on it, the content on
+    ``.message`` (TextMessage.text / JsonMessage.json_object / BlobMessage.blob).
+    Non-text payloads carry binary data, so they render as a terse label plus
+    whatever the tool put in ``meta`` - repr()ing them would dump raw base64
+    into the answer.
     """
     msg_type = getattr(message, "type", None)
+    payload = getattr(message, "message", None)
     if msg_type == ToolInvokeMessage.MessageType.TEXT:
-        return str(getattr(message, "text", "") or "")
+        return str(getattr(payload, "text", "") or "")
     if msg_type == ToolInvokeMessage.MessageType.JSON:
-        payload = getattr(message, "json", None)
-        return json.dumps(payload, ensure_ascii=False) if payload is not None else ""
-    label = getattr(msg_type, "value", msg_type) or "result"
-    url = ""
-    data = getattr(message, "data", None)
-    if isinstance(data, dict):
-        url = str(data.get("url") or data.get("path") or "")
-    return f"[{label}] {url}".rstrip()
+        data = getattr(payload, "json_object", None)
+        return json.dumps(data, ensure_ascii=False) if data is not None else ""
+    label = getattr(msg_type, "value", None) or "result"
+    meta = getattr(message, "meta", None) or {}
+    name = meta.get("filename") or meta.get("mime_type") or ""
+    blob = getattr(payload, "blob", None)
+    size = f" ({len(blob) / 1024:.0f} KB)" if isinstance(blob, bytes | bytearray) else ""
+    return f"[{label}] {name}{size}".rstrip()
 
 
 def _collect_tool_parts(response: Iterable[Any]) -> list[str]:
@@ -134,7 +155,7 @@ def _collect_tool_parts(response: Iterable[Any]) -> list[str]:
     """
     parts: list[str] = []
     for msg in response:
-        if (part := _render_tool_message(msg.message)):
+        if (part := _render_tool_message(msg)):
             parts.append(part)
     return parts
 
@@ -305,7 +326,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
     def _execute_with_progress(
         self,
         llm: _LLMCaller,
-        tools: list[PromptMessageTool],
+        tools: list[ToolEntity],
         plan: Plan,
         scratchpad: Scratchpad,
         start_index: int,
@@ -387,12 +408,13 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
 
         Chat history, knowledge-retrieval context and current-turn images are
         injected here so no caller has to know about them. History items arrive
-        as plain dicts; the SDK coerces them via ensure_prompt_message.
+        as plain dicts (role/content); coerce them into SDK message objects
+        here, mirroring AgentModelConfig.convert_prompt_messages.
 
         ponytail: history rides along on every step, so a long chat is re-sent
         once per step. Scope it to planner + final answer if token cost bites.
         """
-        history = list(history or [])
+        history = [_coerce_history_message(m) for m in (history or [])]
         context_block = self._context_block(context)
         attachments = self._attachment_parts(files or [])
         usage: dict[str, Any] = {"usage": None}
@@ -536,17 +558,23 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                 context="",
             )
 
-    def _invoke_tool(self, name: str, params: dict[str, Any], tools: list[PromptMessageTool]) -> str:
-        prompt_tool = next((t for t in tools if t.name == name), None)
-        if prompt_tool is None:
+    def _invoke_tool(self, name: str, params: dict[str, Any], tools: list[ToolEntity]) -> str:
+        tool = next((t for t in tools if t.identity.name == name), None)
+        if tool is None:
             raise StepExecutionError(f"计划引用了不可用工具：{name}")
-        provider = getattr(prompt_tool, "provider", "") or ""
+        # The plan's params ride on top of the tool's configured runtime values
+        # (webscraper user_agent, mind_map theme, ...). They must be merged in
+        # here: only `parameters` reaches the provider, and Dify ships those
+        # settings alongside the tool exactly because the plugin has to forward
+        # them. credential_id likewise, for tools that carry a credential.
+        parameters = {**(tool.runtime_parameters or {}), **params}
         try:
             response = self._session.tool.invoke(
-                provider_type=prompt_tool.provider_type,
-                provider=provider,
+                provider_type=tool.provider_type,
+                provider=tool.identity.provider or "",
                 tool_name=name,
-                parameters=params,
+                parameters=parameters,
+                credential_id=tool.credential_id,
             )
         except Exception as e:  # noqa: BLE001 - normalised so the step fails via the replan path, like empty results
             raise StepExecutionError(f"工具 {name} 调用失败：{e}") from e
@@ -555,8 +583,20 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             raise StepExecutionError(f"工具 {name} 返回空结果")
         return "\n".join(parts)
 
-    def _prepare_tools(self, tool_entities) -> list[PromptMessageTool]:
-        return self._init_prompt_tools(tool_entities)
+    def _prepare_tools(self, tool_entities) -> list[ToolEntity]:
+        """Normalise the incoming tool config into SDK ToolEntity objects.
+
+        Dify sends tools as plain dicts (api side: ``tool_runtime.entity.
+        model_dump`` plus ``runtime_parameters``/``credential_id``); the SDK's
+        prompt-tool conversion expects ToolEntity and silently drops dicts. The
+        entities are kept as-is further down instead of being converted to
+        PromptMessageTool: invoking a tool needs ``identity.provider`` and
+        ``provider_type``, which the prompt-message view does not carry.
+        """
+        return [
+            t if isinstance(t, ToolEntity) else ToolEntity.model_validate(t)
+            for t in (tool_entities or [])
+        ]
 
     @staticmethod
     def _clamp(value: int, lo: int, hi: int, default: int) -> int:

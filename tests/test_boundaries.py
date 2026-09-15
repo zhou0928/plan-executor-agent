@@ -76,7 +76,16 @@ class TestPlannerLiteralBraces:
             return '{"steps": [{"id": 1, "description": "d", "tool": null, "input_mapping": {}, "output_var": "o"}]}'
 
         p = Planner(llm=llm, planning_prompt=prompt, max_steps=3)
-        plan = p.plan("目标", tools=[{"name": "weather", "description": "查", "parameters": {}}])
+        plan = p.plan(
+            "目标",
+            tools=[
+                SimpleNamespace(
+                    identity=SimpleNamespace(name="weather"),
+                    description=SimpleNamespace(llm="查"),
+                    parameters=[],
+                )
+            ],
+        )
         assert len(plan.steps) == 1
         assert '{"steps": [{"id": 1}]}' in captured["system"], "literal braces must survive"
         assert "weather" in captured["system"], "{tools} must still be substituted"
@@ -162,15 +171,26 @@ class TestRenderToolMessage:
         mod = _load_strategy()
         TYPE = mod.ToolInvokeMessage.MessageType
         cases = [
-            # (message, expected)
-            (SimpleNamespace(type=TYPE.TEXT, text="你好"), "你好"),
-            (SimpleNamespace(type=TYPE.TEXT, text=None), ""),
-            (SimpleNamespace(type=TYPE.JSON, json={"a": 1}), '{"a": 1}'),
-            (SimpleNamespace(type=TYPE.JSON, json=None), ""),
-            # non-TEXT/JSON: terse [label] url, never repr() (could be base64)
-            (SimpleNamespace(type="image", data={"url": "http://x/y.png"}), "[image] http://x/y.png"),
-            (SimpleNamespace(type="image", data=None), "[image]"),
-            (SimpleNamespace(type=None, data={}), "[result]"),
+            # (message, expected) -- the SDK wrapper: type on the outside,
+            # payload inside .message (text/json_object/blob)
+            (SimpleNamespace(type=TYPE.TEXT, message=SimpleNamespace(text="你好")), "你好"),
+            (SimpleNamespace(type=TYPE.TEXT, message=SimpleNamespace(text=None)), ""),
+            (
+                SimpleNamespace(type=TYPE.JSON, message=SimpleNamespace(json_object={"a": 1})),
+                '{"a": 1}',
+            ),
+            (SimpleNamespace(type=TYPE.JSON, message=SimpleNamespace(json_object=None)), ""),
+            # non-TEXT/JSON: terse [label] meta, never repr() (could be base64)
+            (
+                SimpleNamespace(
+                    type=TYPE.BLOB,
+                    message=SimpleNamespace(blob=b"x" * 2048),
+                    meta={"filename": "map.png", "mime_type": "image/png"},
+                ),
+                "[blob] map.png (2 KB)",
+            ),
+            (SimpleNamespace(type=TYPE.IMAGE, message=None, meta=None), "[image]"),
+            (SimpleNamespace(type=None, message=None), "[result]"),
         ]
         for msg, expected in cases:
             assert mod._render_tool_message(msg) == expected
@@ -250,9 +270,9 @@ class TestCollectToolParts:
         mod = _load_strategy()
         TYPE = mod.ToolInvokeMessage.MessageType
         msgs = [
-            SimpleNamespace(message=SimpleNamespace(type=TYPE.TEXT, text="ok")),
-            SimpleNamespace(message=SimpleNamespace(type=TYPE.TEXT, text="")),
-            SimpleNamespace(message=SimpleNamespace(type=TYPE.JSON, json=None)),
+            SimpleNamespace(type=TYPE.TEXT, message=SimpleNamespace(text="ok")),
+            SimpleNamespace(type=TYPE.TEXT, message=SimpleNamespace(text="")),
+            SimpleNamespace(type=TYPE.JSON, message=SimpleNamespace(json_object=None)),
         ]
         assert mod._collect_tool_parts(msgs) == ["ok"]
 
@@ -260,8 +280,8 @@ class TestCollectToolParts:
         mod = _load_strategy()
         TYPE = mod.ToolInvokeMessage.MessageType
         all_blank = [
-            SimpleNamespace(message=SimpleNamespace(type=TYPE.JSON, json=None)),
-            SimpleNamespace(message=SimpleNamespace(type=TYPE.TEXT, text="")),
+            SimpleNamespace(type=TYPE.JSON, message=SimpleNamespace(json_object=None)),
+            SimpleNamespace(type=TYPE.TEXT, message=SimpleNamespace(text="")),
         ]
         assert mod._collect_tool_parts(all_blank) == []
 
@@ -275,6 +295,13 @@ class TestInvokeToolNormalization:
 
         strat = object.__new__(mod.PlanExecutorAgentAgentStrategy)
         strat._session = SimpleNamespace(tool=SimpleNamespace(invoke=boom))
-        tools = [SimpleNamespace(name="weather", provider_type="builtin", provider="")]
+        tools = [
+            SimpleNamespace(
+                identity=SimpleNamespace(name="weather", provider=""),
+                provider_type="builtin",
+                runtime_parameters={},
+                credential_id=None,
+            )
+        ]
         with pytest.raises(mod.StepExecutionError, match=r"工具 weather 调用失败.*provider down"):
             strat._invoke_tool("weather", {}, tools)

@@ -30,8 +30,8 @@ def allowed_tool_names(value: Any) -> set[str] | None:
 
 
 def filter_allowed_tools(tools: list[Any], allowed_tools: Any) -> list[Any]:
-    """Keep only tools whose `.name` is in the allowlist; unrestricted when empty."""
+    """Keep only tools whose `identity.name` is in the allowlist; unrestricted when empty."""
     names = allowed_tool_names(allowed_tools)
     if names is None:
         return tools
-    return [tool for tool in tools if getattr(tool, "name", None) in names]
+    return [t for t in tools if getattr(getattr(t, "identity", None), "name", None) in names]

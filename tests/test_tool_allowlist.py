@@ -1,19 +1,23 @@
 """allowlist parsing: Dify passes `allowed_tools` as `type: any`, so it can
 arrive as None, "", a list, or a JSON-encoded string. Empty always = no filter."""
 
+from types import SimpleNamespace
+
 from core.tool_allowlist import allowed_tool_names, filter_allowed_tools
 
 
 class FakeTool:
+    """Stands in for the SDK ToolEntity: the name lives under identity."""
+
     def __init__(self, name: str):
-        self.name = name
+        self.identity = SimpleNamespace(name=name)
 
 
 TOOLS = [FakeTool("search"), FakeTool("read_file"), FakeTool("http")]
 
 
 def names_of(tools) -> set[str]:
-    return {t.name for t in tools}
+    return {t.identity.name for t in tools}
 
 
 # ---------- allowed_tool_names ----------

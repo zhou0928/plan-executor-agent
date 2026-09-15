@@ -1,14 +1,23 @@
 import pytest
+from types import SimpleNamespace
 
 from core.executor import Executor
 from core.plan import Plan
-from core.planner import Planner, extract_json, tools_description
+from core.planner import DEFAULT_PLANNING_PROMPT, Planner, extract_json, tools_description
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
 
 
 # ---------- helpers ----------
+
+def fake_tool(name: str, description: str = "", params: tuple[str, ...] = ()) -> SimpleNamespace:
+    """Minimal stand-in for the SDK ToolEntity the strategy hands to the planner."""
+    return SimpleNamespace(
+        identity=SimpleNamespace(name=name),
+        description=SimpleNamespace(llm=description),
+        parameters=[SimpleNamespace(name=p) for p in params],
+    )
 
 def make_plan(raw: str) -> Plan:
     return Plan.parse(raw)
@@ -67,7 +76,7 @@ class TestPlanner:
             captured["system"], captured["user"] = system, user
             return '{"steps": [{"id": 1, "description": "d", "tool": null, "input_mapping": {}, "output_var": "o"}]}'
 
-        Planner(llm=llm).plan("北京天气", tools=[{"name": "weather", "description": "查天气", "parameters": {"city": {}}}], instruction="用中文")
+        Planner(llm=llm).plan("北京天气", tools=[fake_tool("weather", "查天气", ("city",))], instruction="用中文")
         assert "weather" in captured["system"]
         assert "北京天气" in captured["user"]
         assert "用中文" in captured["user"]
@@ -87,8 +96,16 @@ class TestPlanner:
         assert "无可用工具" in tools_description([])
 
     def test_tools_description_lists(self):
-        d = tools_description([{"name": "t1", "description": "desc", "parameters": {"a": {}, "b": {}}}])
+        d = tools_description([fake_tool("t1", "desc", ("a", "b"))])
         assert "t1" in d and "desc" in d and "a" in d
+
+    def test_default_prompt_shows_unescaped_json_example(self):
+        # plan() substitutes with .replace(), so brace escaping would reach the
+        # model verbatim: a doubled {{"steps" ...}} example taught it to emit
+        # non-string input_mapping values, which Plan.parse rejects.
+        assert '{"steps": [{"id": 1' in DEFAULT_PLANNING_PROMPT
+        assert '"{{变量}}"' in DEFAULT_PLANNING_PROMPT
+        assert '{{"steps"' not in DEFAULT_PLANNING_PROMPT
 
 
 # ---------- Executor ----------

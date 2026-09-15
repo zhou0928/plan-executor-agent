@@ -26,19 +26,26 @@ DEFAULT_PLANNING_PROMPT = """你是任务规划专家。把用户目标拆解为
    信息缺失时，在同一步内用合理默认值直接产出，并在 description 里注明假设。
 3. 最后一步必须产出用户要的东西本身（脚本/答案/文档），而不是对它的描述。
 4. 优先使用工具获取事实；纯总结、推理类步骤把 tool 设为 null。
-5. input_mapping 里用 {{"变量名"}} 引用前面步骤的 output_var 或初始变量。
+5. input_mapping 的值必须是字符串：用 "{{变量名}}" 引用前面步骤的 output_var 或初始变量，
+   例如 {"city": "{{query}}"}。
 6. 只输出 JSON，不要输出任何其他文字。格式：
-{{"steps": [{{"id": 1, "description": "...", "tool": "工具名或null", "input_mapping": {{"参数": "{{"{{变量}}"}}"}}, "output_var": "变量名"}}]}}"""
+{"steps": [{"id": 1, "description": "...", "tool": "工具名或null", "input_mapping": {"参数": "{{变量}}"}, "output_var": "变量名"}]}"""
 
 
-def tools_description(tools: list[dict[str, Any]]) -> str:
-    """Render the tool manifest injected into the planning prompt."""
+def tools_description(tools: list[Any]) -> str:
+    """Render the tool manifest injected into the planning prompt.
+
+    Tools are SDK ToolEntity objects (the strategy layer owns that import, so
+    this module stays dependency-free); fields are read by attribute, not by
+    dict key: identity.name, description.llm, parameters[].name.
+    """
     if not tools:
         return "（无可用工具，请全部使用纯推理步骤）"
     lines = []
     for t in tools:
-        params = ", ".join(t.get("parameters", {}).keys()) or "无参数"
-        lines.append(f"- {t['name']}: {t.get('description', '')}（参数: {params}）")
+        params = ", ".join(p.name for p in (t.parameters or [])) or "无参数"
+        desc = t.description.llm if t.description else ""
+        lines.append(f"- {t.identity.name}: {desc}（参数: {params}）")
     return "\n".join(lines)
 
 
@@ -74,7 +81,7 @@ class Planner:
     def plan(
         self,
         goal: str,
-        tools: list[dict[str, Any]],
+        tools: list[Any],
         instruction: str = "",
         initial_vars: list[str] | None = None,
     ) -> Plan:
