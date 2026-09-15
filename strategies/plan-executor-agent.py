@@ -33,6 +33,7 @@ from dify_plugin.entities.tool import ToolInvokeMessage
 from dify_plugin.file.file import File, FileType
 from dify_plugin.interfaces.agent import AgentStrategy, ToolEntity
 
+from core.budget import BoundedCaller, BudgetTimeout
 from core.execution_metadata import ExecutionMetadata
 from core.executor import ExecutionOutcome, Executor
 from core.params import to_int
@@ -272,6 +273,10 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             usage=usage,
             usage_lock=usage_lock,
         )
+        # Planning and replanning are non-streaming single calls: a slow model
+        # can spend minutes on one of them, which is exactly how an invocation
+        # outlives the daemon's PLUGIN_MAX_EXECUTION_TIMEOUT. Bound them.
+        planner_llm = BoundedCaller(plan_llm, deadline)
         scratchpad = Scratchpad(initial={"query": goal})
         initial_vars = {"query"}
 
@@ -293,7 +298,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             return
 
         # --- Phase 1: planning (category 3 error exits here) ---
-        planner = Planner(llm=plan_llm, planning_prompt=planning_prompt, max_steps=max_steps)
+        planner = Planner(llm=planner_llm, planning_prompt=planning_prompt, max_steps=max_steps)
         try:
             plan = _plan_with_validation(
                 planner, goal, tools, instruction, initial_vars, budget=max_invalid_plan, deadline=deadline
@@ -311,7 +316,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             yield self.create_text_message(f"📋 初始计划：\n{self._render_plan(plan)}\n")
 
         # --- Phase 2+3: execute / replan loop ---
-        replanner = Replanner(llm=plan_llm, max_replan=max_replan, max_invalid_plan=max_invalid_plan)
+        replanner = Replanner(llm=planner_llm, max_replan=max_replan, max_invalid_plan=max_invalid_plan)
         replan_count = 0
         current_plan = plan
         start_index = 0
@@ -398,9 +403,16 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                 yield self.create_log_message(
                     PROGRESS_LABEL, {"warning": f"重规划生成的计划无效（{e}），重试"}
                 )
-            except BudgetExhaustedError as e:
+            except (BudgetExhaustedError, BudgetTimeout) as e:
                 yield from self._final_answer(
-                    plan_llm, goal, scratchpad, output_variable, context_items, usage, reason=str(e)
+                    plan_llm,
+                    goal,
+                    scratchpad,
+                    output_variable,
+                    context_items,
+                    usage,
+                    reason=str(e),
+                    deadline=deadline,
                 )
                 return
 

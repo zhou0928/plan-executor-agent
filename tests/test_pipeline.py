@@ -1,6 +1,9 @@
+import time
+
 import pytest
 from types import SimpleNamespace
 
+from core.budget import BoundedCaller, BudgetTimeout, run_with_budget
 from core.executor import Executor
 from core.plan import Plan
 from core.planner import DEFAULT_PLANNING_PROMPT, Planner, extract_json, tools_description
@@ -341,3 +344,41 @@ class TestThinkFilter:
         f = ThinkFilter()
         assert f.feed("看这个<") == "看这个"
         assert f.flush() == "<"
+
+class TestRunWithBudget:
+    def test_no_deadline_runs_plainly(self):
+        assert run_with_budget(lambda: "ok", None, "调用") == "ok"
+
+    def test_past_deadline_never_calls(self):
+        called = []
+        with pytest.raises(BudgetTimeout):
+            run_with_budget(lambda: called.append(1), time.monotonic() - 1, "调用")
+        assert called == []
+
+    def test_overrun_raises_instead_of_hanging(self):
+        started = time.monotonic()
+        with pytest.raises(BudgetTimeout):
+            run_with_budget(lambda: time.sleep(5), time.monotonic() + 0.15, "调用")
+        assert time.monotonic() - started < 3, "must return when the budget is gone"
+
+    def test_inner_error_propagates(self):
+        def boom():
+            raise ValueError("模型炸了")
+        with pytest.raises(ValueError):
+            run_with_budget(boom, time.monotonic() + 5, "调用")
+
+
+class TestBoundedCaller:
+    def test_forwards_to_inner(self):
+        seen = []
+
+        def inner(system, user):
+            seen.append((system, user))
+            return "reply"
+
+        assert BoundedCaller(inner, time.monotonic() + 5)("sys", "usr") == "reply"
+        assert seen == [("sys", "usr")]
+
+    def test_budget_applies_to_the_call(self):
+        with pytest.raises(BudgetTimeout):
+            BoundedCaller(lambda s, u: time.sleep(5), time.monotonic() + 0.15)("sys", "usr")
