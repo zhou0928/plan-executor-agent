@@ -154,6 +154,16 @@ class TestExecutorDeadline:
         assert not outcome.timed_out
         assert sp.get("w") == "ok"
 
+    def test_step_timeout_capped_by_remaining_budget(self):
+        sp = Scratchpad({"city": "北京"})
+        started = time.monotonic()
+        outcome = Executor(HangingPool(), step_timeout=30, deadline=started + 0.15).run(
+            make_plan(PLAN_1STEP), sp
+        )
+        elapsed = time.monotonic() - started
+        assert outcome.failed_step is not None, "a step that outlives the budget must fail, not hang"
+        assert elapsed < 5, f"budget must cap the step timeout, took {elapsed:.1f}s"
+
     def test_parallel_past_deadline_reports_timed_out(self):
         sp = Scratchpad()
         plan = make_plan(

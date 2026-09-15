@@ -350,6 +350,21 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             failed = outcome.failed_step
             assert failed is not None
 
+            if deadline is not None and time.monotonic() >= deadline:
+                # A replan is another model call; past the budget it only eats
+                # into the daemon's hard timeout without ever being used.
+                yield from self._final_answer(
+                    plan_llm,
+                    goal,
+                    scratchpad,
+                    output_variable,
+                    context_items,
+                    usage,
+                    reason=f"执行时间预算（{budget_seconds} 秒）已用尽，剩余步骤已跳过",
+                    deadline=deadline,
+                )
+                return
+
             # Category 2: step failure -> try replanning
             try:
                 yield self.create_log_message(

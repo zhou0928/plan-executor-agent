@@ -79,8 +79,12 @@ class Executor:
         caller's normal failure path (record + Replanner) takes over; the
         hung call keeps running on a daemon thread and never blocks exit.
         """
-        if self._step_timeout is None:
+        if self._step_timeout is None and self._deadline is None:
             return self._pool.execute(step, scratchpad, stream=stream)
+        timeout = self._step_timeout
+        if self._deadline is not None:
+            left = self._deadline - time.monotonic()
+            timeout = left if timeout is None else min(timeout, left)
         box: dict[str, str] = {}
         errors: list[BaseException] = []
 
@@ -92,9 +96,9 @@ class Executor:
 
         worker = threading.Thread(target=target, daemon=True)
         worker.start()
-        worker.join(self._step_timeout)
+        worker.join(timeout)
         if worker.is_alive():
-            raise StepExecutionError(f"步骤执行超时（>{self._step_timeout:g} 秒）")
+            raise StepExecutionError(f"步骤执行超时（>{timeout:g} 秒）")
         if errors:
             raise errors[0]
         return box["result"]
