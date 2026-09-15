@@ -285,14 +285,33 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         # ponytail: no tools = answer directly. Add any tool to re-enable planning.
         if not tools:
             answer = ""
+            answer_filter = ThinkFilter()
+            cut_off = False
             try:
                 for piece in plan_llm.stream(instruction or FAST_PATH_SYSTEM, goal):
-                    answer += piece
-                    yield self.create_text_message(piece)
+                    visible = answer_filter.feed(piece)
+                    if visible:
+                        answer += visible
+                        yield self.create_text_message(visible)
+                    # A streamed call cannot be interrupted once it is in flight,
+                    # but forwarding can stop: past the wall-clock budget the node
+                    # answers with what the model already produced instead of
+                    # running until the daemon kills the whole invocation.
+                    if deadline is not None and time.monotonic() >= deadline:
+                        cut_off = True
+                        break
             except Exception as e:
                 yield self.create_text_message(f"[计划执行 Agent] 模型调用失败：{e}\n")
                 yield from self._emit_tail("", context_items, usage)
                 return
+            tail = answer_filter.flush()
+            if tail:
+                answer += tail
+                yield self.create_text_message(tail)
+            if cut_off:
+                yield self.create_text_message(
+                    f"\n\n[计划执行 Agent] 执行时间预算（{budget_seconds} 秒）已用尽，以上为已产出的部分内容。\n"
+                )
             scratchpad.set(output_variable, answer)
             yield from self._emit_tail(answer, context_items, usage)
             return

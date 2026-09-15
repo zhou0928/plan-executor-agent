@@ -175,3 +175,8 @@ Thumbs.db
 # Dify plugin packages
 #  To prevent packaging repetitively
 *.difypkg
+
+# Development-only files. The .difypkg ships what the runtime needs; the tests
+# and the scaffold guide stay in the repository (see the README's source link).
+tests/
+GUIDE.md

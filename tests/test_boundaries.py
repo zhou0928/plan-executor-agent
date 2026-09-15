@@ -373,3 +373,59 @@ class TestInvokeToolNormalization:
         ]
         with pytest.raises(mod.StepExecutionError, match=r"工具 weather 调用失败.*provider down"):
             strat._invoke_tool("weather", {}, tools)
+
+
+class TestFastPathNoTools:
+    """No mounted tools -> answer directly through one streamed call.
+
+    Regression: this path used to forward raw chunks, so a thinking model's
+    ``<think>`` block was rendered into the answer (every other path runs the
+    text through ThinkFilter), and it ignored the wall-clock budget entirely.
+    """
+
+    @staticmethod
+    def _strategy(mod, chunks, seconds=480):
+        strat = object.__new__(mod.PlanExecutorAgentAgentStrategy)
+        strat.response_type = mod.AgentInvokeMessage
+
+        def invoke(**kwargs):
+            assert kwargs["stream"] is True
+            for piece in chunks:
+                yield SimpleNamespace(
+                    delta=SimpleNamespace(message=SimpleNamespace(content=piece), usage=None)
+                )
+
+        strat._session = SimpleNamespace(model=SimpleNamespace(llm=SimpleNamespace(invoke=invoke)))
+        return strat, {
+            "model": {"provider": "p", "model": "m"},
+            "query": "目标",
+            "tools": [],
+            "max_execution_seconds": seconds,
+        }
+
+    @staticmethod
+    def _text(mod, msgs) -> str:
+        TYPE = mod.AgentInvokeMessage.MessageType
+        return "".join(m.message.text for m in msgs if m.type == TYPE.TEXT)
+
+    def test_thinking_block_never_reaches_the_answer(self):
+        mod = _load_strategy()
+        # split across chunks on purpose: the tag arrives in fragments
+        strat, params = self._strategy(mod, ["<thi", "nk>内心戏</thi", "nk>答案"])
+        text = self._text(mod, list(strat._invoke(params)))
+        assert text == "答案", text
+
+    def test_past_deadline_stops_forwarding(self):
+        mod = _load_strategy()
+
+        def chunks():
+            yield "A"
+            yield "B"
+            time.sleep(1.05)  # burns the whole 1s budget
+            yield "C"  # forwarded, then the budget check breaks the loop
+            yield "D"  # never reached
+
+        strat, params = self._strategy(mod, chunks(), seconds=1)
+        text = self._text(mod, list(strat._invoke(params)))
+        assert "D" not in text, text
+        assert "执行时间预算" in text, text
