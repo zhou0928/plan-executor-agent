@@ -6,7 +6,7 @@ on:
 
 jobs:
   publish:
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -79,7 +79,7 @@ jobs:
           git checkout main
           git pull origin main
 
-          BRANCH_NAME="bump-${{ steps.get_basic_info.outputs.plugin_name }}-plugin-${{ steps.get_basic_info.outputs.version }}"
+          BRANCH_NAME="${{ steps.get_basic_info.outputs.plugin_name }}-${{ steps.get_basic_info.outputs.version }}"
           git checkout -b "$BRANCH_NAME"
 
           git add .
