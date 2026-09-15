@@ -149,6 +149,18 @@ parameters:
       en_US: Leave empty to use the built-in Chinese planning prompt
       zh_Hans: 留空使用内置中文规划提示词；填写则完全替换
       ja_JP: Override planning prompt
+  - name: max_result_chars
+    type: number
+    required: false
+    default: 8000
+    label:
+      en_US: Max result chars
+      zh_Hans: 单步结果长度上限
+      ja_JP: Max result chars
+    help:
+      en_US: Tool/retrieval output longer than this is clipped, keeping both ends. 0 = no limit.
+      zh_Hans: 工具或检索结果超过该长度会截断（保留头尾、中间省略），避免灌爆后续提示词。0 表示不限制。
+      ja_JP: Clip long tool output (keeps both ends). 0 = no limit.
   - name: output_variable
     type: string
     required: false

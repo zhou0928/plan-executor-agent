@@ -15,7 +15,7 @@ import json
 import queue
 import threading
 import time
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import Any
 
 from dify_plugin.core.runtime import Session
@@ -41,6 +41,7 @@ from core.planner import Planner
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad, validate_plan
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
+from core.text import truncate_middle
 from core.tool_allowlist import filter_allowed_tools
 
 FINAL_ANSWER_SYSTEM = (
@@ -207,10 +208,13 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
 
     def _invoke(self, parameters: dict[str, Any]) -> Generator[AgentInvokeMessage]:
         model_config = parameters["model"]
-        tools = filter_allowed_tools(
-            self._prepare_tools(parameters.get("tools") or []),
-            parameters.get("allowed_tools"),
-        )
+        mounted_tools = self._prepare_tools(parameters.get("tools") or [])
+        tools = filter_allowed_tools(mounted_tools, parameters.get("allowed_tools"))
+        if mounted_tools and not tools:
+            yield self.create_log_message(
+                PROGRESS_LABEL,
+                {"warning": "allowed_tools 与已挂载工具名无一匹配，已按无工具模式执行"},
+            )
         goal = str(parameters.get("query") or "")
         instruction = parameters.get("instruction") or ""
         max_steps = self._clamp(to_int(parameters.get("max_steps"), 20), 1, 50, 20)
@@ -225,8 +229,31 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         # strategy is responsible for putting them back into prompt_messages.
         history = list((model_config or {}).get("history_prompt_messages") or [])
         context_items = parameters.get("context") or []
+        # 0 keeps full tool output; anything else caps what a single step may
+        # paste into the next prompt (a scraped page would otherwise dominate it).
+        result_chars = to_int(parameters.get("max_result_chars"), 8000)
+        result_limit = None if result_chars <= 0 else self._clamp(result_chars, 500, 200_000, 8000)
 
-        llm = self._make_llm_caller(model_config, history=history, context=context_items, files=files)
+        # Two funnels over one usage sink: planning and the final answer carry the
+        # chat history, per-step calls do not (that would re-send the whole
+        # conversation once per step).
+        usage: dict[str, Any] = {"usage": None}
+        usage_lock = threading.Lock()
+        plan_llm = self._make_llm_caller(
+            model_config,
+            history=history,
+            context=context_items,
+            files=files,
+            usage=usage,
+            usage_lock=usage_lock,
+        )
+        step_llm = self._make_llm_caller(
+            model_config,
+            context=context_items,
+            files=files,
+            usage=usage,
+            usage_lock=usage_lock,
+        )
         scratchpad = Scratchpad(initial={"query": goal})
         initial_vars = {"query"}
 
@@ -236,37 +263,37 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         if not tools:
             answer = ""
             try:
-                for piece in llm.stream(instruction or FAST_PATH_SYSTEM, goal):
+                for piece in plan_llm.stream(instruction or FAST_PATH_SYSTEM, goal):
                     answer += piece
                     yield self.create_text_message(piece)
             except Exception as e:
                 yield self.create_text_message(f"[计划执行 Agent] 模型调用失败：{e}\n")
-                yield from self._emit_tail("", context_items, llm.usage)
+                yield from self._emit_tail("", context_items, usage)
                 return
             scratchpad.set(output_variable, answer)
-            yield from self._emit_tail(answer, context_items, llm.usage)
+            yield from self._emit_tail(answer, context_items, usage)
             return
 
         # --- Phase 1: planning (category 3 error exits here) ---
-        planner = Planner(llm=llm, planning_prompt=planning_prompt, max_steps=max_steps)
+        planner = Planner(llm=plan_llm, planning_prompt=planning_prompt, max_steps=max_steps)
         try:
             plan = _plan_with_validation(
                 planner, goal, tools, instruction, initial_vars, budget=max_invalid_plan
             )
         except InvalidPlanError as e:
             yield self.create_text_message(f"[计划执行 Agent] 规划层失败：{e}\n")
-            yield from self._emit_tail("", context_items, llm.usage)
+            yield from self._emit_tail("", context_items, usage)
             return
         except Exception as e:  # model unavailable etc.
             yield self.create_text_message(f"[计划执行 Agent] 模型调用失败（规划层）：{e}\n")
-            yield from self._emit_tail("", context_items, llm.usage)
+            yield from self._emit_tail("", context_items, usage)
             return
 
         if verbose:
             yield self.create_text_message(f"📋 初始计划：\n{self._render_plan(plan)}\n")
 
         # --- Phase 2+3: execute / replan loop ---
-        replanner = Replanner(llm=llm, max_replan=max_replan, max_invalid_plan=max_invalid_plan)
+        replanner = Replanner(llm=plan_llm, max_replan=max_replan, max_invalid_plan=max_invalid_plan)
         replan_count = 0
         current_plan = plan
         start_index = 0
@@ -274,7 +301,15 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         streamed: dict[str, bool] = {}
         while True:
             outcome = yield from self._execute_with_progress(
-                llm, tools, current_plan, scratchpad, start_index, verbose, max_parallel, streamed
+                step_llm,
+                tools,
+                current_plan,
+                scratchpad,
+                start_index,
+                verbose,
+                max_parallel,
+                streamed,
+                max_result_chars=result_limit,
             )
 
             if outcome.completed:
@@ -302,14 +337,21 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                     yield self.create_text_message(f"📋 新计划（第 {replan_count} 次重规划）：\n{self._render_plan(new_plan)}\n")
             except InvalidPlanError as e:
                 if replanner.invalid_budget_left <= 0:
-                    yield from self._final_answer(llm, goal, scratchpad, output_variable,
-                                                  context_items, llm.usage,
-                                                  reason=f"重规划生成的计划无效：{e}")
+                    yield from self._final_answer(
+                        plan_llm,
+                        goal,
+                        scratchpad,
+                        output_variable,
+                        context_items,
+                        usage,
+                        reason=f"重规划生成的计划无效：{e}",
+                    )
                     return
                 yield self.create_text_message(f"⚠️ 重规划生成的计划无效（{e}），重试…\n")
             except BudgetExhaustedError as e:
-                yield from self._final_answer(llm, goal, scratchpad, output_variable,
-                                              context_items, llm.usage, reason=str(e))
+                yield from self._final_answer(
+                    plan_llm, goal, scratchpad, output_variable, context_items, usage, reason=str(e)
+                )
                 return
 
         # Success: emit the final variable's content. The plan's output_var names
@@ -318,7 +360,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         final_text = str(scratchpad.get(final_var, ""))
         if not streamed.get("answer"):
             yield self.create_text_message(final_text)
-        yield from self._emit_tail(final_text, context_items, llm.usage)
+        yield from self._emit_tail(final_text, context_items, usage)
 
     # ------------------------------------------------------------------
     # helpers
@@ -333,6 +375,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         verbose: bool = False,
         max_parallel: int = 1,
         streamed: dict[str, bool] | None = None,
+        max_result_chars: int | None = None,
     ) -> Generator[AgentInvokeMessage, None, ExecutionOutcome]:
         """Run the executor on a worker thread while keeping the node stream alive.
 
@@ -342,10 +385,11 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         answer instead, one per line.
         Tokens from the streamed final step go out as text and set
         ``streamed["answer"]`` so the caller does not repeat the answer.
+        Files a tool produced go out as node file outputs (see _artifact_message).
         The heartbeat is always emitted (a silent generator can idle the node).
         """
         streamed = streamed if streamed is not None else {}
-        events: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        events: queue.Queue[tuple[str, Any] | None] = queue.Queue()
         outcome: list[ExecutionOutcome] = []
         failure: list[BaseException] = []
 
@@ -353,11 +397,16 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             streamed["answer"] = True
             events.put(("token", text))
 
+        def on_artifact(message: AgentInvokeMessage) -> None:
+            events.put(("artifact", message))
+
         pool = LocalStepExecutor(
             llm=llm,
             llm_stream=llm.stream,
             on_token=on_token,
-            tool_invoker=lambda name, params: self._invoke_tool(name, params, tools),
+            tool_invoker=lambda name, params: self._invoke_tool(
+                name, params, tools, limit=max_result_chars, on_artifact=on_artifact
+            ),
         )
         executor = Executor(
             pool,
@@ -387,6 +436,8 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             kind, payload = event
             if kind == "token":
                 yield self.create_text_message(payload)
+            elif kind == "artifact":
+                yield payload
             elif verbose:
                 yield self.create_text_message(f"{payload}\n")
             else:
@@ -402,22 +453,26 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         history: list | None = None,
         context: Any = None,
         files: list | None = None,
+        usage: dict[str, Any] | None = None,
+        usage_lock: threading.Lock | None = None,
     ) -> _LLMCaller:
-        """Build the single funnel every LLM call goes through (planner,
-        replanner, step reasoning).
+        """Build one funnel every LLM call of a phase goes through.
 
         Chat history, knowledge-retrieval context and current-turn images are
         injected here so no caller has to know about them. History items arrive
         as plain dicts (role/content); coerce them into SDK message objects
         here, mirroring AgentModelConfig.convert_prompt_messages.
 
-        ponytail: history rides along on every step, so a long chat is re-sent
-        once per step. Scope it to planner + final answer if token cost bites.
+        Callers that should carry history pass it; the step caller passes none,
+        because a long chat would otherwise be re-sent once per step. Both share
+        one ``usage`` dict (and its lock), so the node's usage panel still sees
+        every call.
         """
         history = [_coerce_history_message(m) for m in (history or [])]
         context_block = self._context_block(context)
         attachments = self._attachment_parts(files or [])
-        usage: dict[str, Any] = {"usage": None}
+        usage = usage if usage is not None else {"usage": None}
+        lock = usage_lock if usage_lock is not None else threading.Lock()
 
         def build(system: str, user: str) -> list[Any]:
             if context_block:
@@ -429,7 +484,8 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
 
         def record(chunk_usage: Any) -> None:
             if chunk_usage is not None:
-                self.increase_usage(usage, chunk_usage)
+                with lock:  # steps may run concurrently and share this dict
+                    self.increase_usage(usage, chunk_usage)
 
         def invoke(system: str, user: str) -> str:
             messages = build(system, user)
@@ -558,7 +614,14 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                 context="",
             )
 
-    def _invoke_tool(self, name: str, params: dict[str, Any], tools: list[ToolEntity]) -> str:
+    def _invoke_tool(
+        self,
+        name: str,
+        params: dict[str, Any],
+        tools: list[ToolEntity],
+        limit: int | None = None,
+        on_artifact: Callable[[AgentInvokeMessage], None] | None = None,
+    ) -> str:
         tool = next((t for t in tools if t.identity.name == name), None)
         if tool is None:
             raise StepExecutionError(f"计划引用了不可用工具：{name}")
@@ -578,10 +641,39 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             )
         except Exception as e:  # noqa: BLE001 - normalised so the step fails via the replan path, like empty results
             raise StepExecutionError(f"工具 {name} 调用失败：{e}") from e
-        parts = _collect_tool_parts(response)
+        messages = list(response)  # rendered once for text and once for artifacts
+        if on_artifact is not None:
+            for message in messages:
+                if (artifact := self._artifact_message(message)) is not None:
+                    on_artifact(artifact)
+        parts = _collect_tool_parts(messages)
         if not parts:
             raise StepExecutionError(f"工具 {name} 返回空结果")
-        return "\n".join(parts)
+        return truncate_middle("\n".join(parts), limit)
+
+    def _artifact_message(self, message: Any) -> AgentInvokeMessage | None:
+        """Turn a tool's binary/link output into a node file output.
+
+        Text results already reach the plan; without this a mind-map PNG or a
+        converted docx would exist only as a "[blob] x.png" note in the answer.
+        Types are matched by value, not by enum member: a newer API can send a
+        type this SDK does not know (e.g. binary_link), and an unknown type must
+        stay a no-op rather than crash the step.
+        """
+        msg_type = getattr(getattr(message, "type", None), "value", None)
+        payload = getattr(message, "message", None)
+        meta = getattr(message, "meta", None) or {}
+        blob = getattr(payload, "blob", None)
+        if msg_type == "blob" and isinstance(blob, bytes | bytearray):
+            return self.create_blob_message(blob=bytes(blob), meta=meta)
+        url = getattr(payload, "text", None)
+        if not url:
+            return None
+        if msg_type in ("image", "image_link"):
+            return self.create_image_message(str(url))
+        if msg_type in ("link", "binary_link"):
+            return self.create_link_message(str(url))
+        return None
 
     def _prepare_tools(self, tool_entities) -> list[ToolEntity]:
         """Normalise the incoming tool config into SDK ToolEntity objects.

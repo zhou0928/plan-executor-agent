@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from dify_plugin.entities.agent import AgentInvokeMessage  # noqa: E402
 from dify_plugin.entities.tool import ToolInvokeMessage, ToolProviderType  # noqa: E402
 from dify_plugin.interfaces.agent import ToolEntity  # noqa: E402
 
@@ -83,6 +85,25 @@ def _blob_result() -> list:
     ]
 
 
+def _image_link_result() -> list:
+    return [
+        ToolInvokeMessage(
+            type=ToolInvokeMessage.MessageType.IMAGE_LINK,
+            message=ToolInvokeMessage.TextMessage(text="https://host/files/tools/abc.png"),
+            meta={"filename": "map.png", "mime_type": "image/png"},
+        )
+    ]
+
+
+def _huge_text_result(size: int = 20000) -> list:
+    return [
+        ToolInvokeMessage(
+            type=ToolInvokeMessage.MessageType.TEXT,
+            message=ToolInvokeMessage.TextMessage(text="A" * size),
+        )
+    ]
+
+
 def main() -> int:
     from core.planner import tools_description
 
@@ -93,6 +114,7 @@ def main() -> int:
         captured.update(kwargs)
         return _text_result()
 
+    strat.response_type = AgentInvokeMessage  # set by AgentStrategy.__init__, skipped via __new__
     strat._session = SimpleNamespace(tool=SimpleNamespace(invoke=invoke))
 
     # 1. dict -> ToolEntity (bug 1: a raw dict made the SDK drop every tool)
@@ -131,9 +153,55 @@ def main() -> int:
     else:
         raise AssertionError("unknown tool did not raise StepExecutionError")
 
-    # a blob tool result must never be repr()'d into the answer (base64 blowup)
+    # a blob tool result must never be repr()'d into the answer (base64 blowup),
+    # and it must reach the node output as a real file
+    artifacts: list = []
     strat._session = SimpleNamespace(tool=SimpleNamespace(invoke=lambda **kw: _blob_result()))
-    assert strat._invoke_tool("webscraper", {}, tools) == "[blob] map.png (2 KB)"
+    assert strat._invoke_tool(
+        "webscraper", {}, tools, on_artifact=artifacts.append
+    ) == "[blob] map.png (2 KB)"
+    assert len(artifacts) == 1, artifacts
+    assert artifacts[0].type == AgentInvokeMessage.MessageType.BLOB, artifacts[0].type
+    assert artifacts[0].message.blob == b"x" * 2048
+
+    # link-ish results are forwarded too (image inline, other links as links)
+    artifacts.clear()
+    strat._session = SimpleNamespace(tool=SimpleNamespace(invoke=lambda **kw: _image_link_result()))
+    strat._invoke_tool("webscraper", {}, tools, on_artifact=artifacts.append)
+    assert len(artifacts) == 1, artifacts
+    assert artifacts[0].type == AgentInvokeMessage.MessageType.IMAGE, artifacts[0].type
+    assert artifacts[0].message.text.endswith("abc.png"), artifacts[0].message
+
+    # oversized output is clipped with both ends kept
+    strat._session = SimpleNamespace(tool=SimpleNamespace(invoke=lambda **kw: _huge_text_result()))
+    clipped = strat._invoke_tool("webscraper", {}, tools, limit=1000)
+    assert "已省略" in clipped, clipped[:80]
+    assert len(clipped) < 1200, len(clipped)
+    assert clipped.startswith("A") and clipped.endswith("A")
+    full = strat._invoke_tool("webscraper", {}, tools, limit=None)
+    assert len(full) == 20000, len(full)
+
+    # history rides on the planning/final-answer funnel only, and both share one
+    # usage sink so the node's usage panel still sees every call
+    seen: dict = {}
+
+    def capture(**kwargs):
+        seen["messages"] = kwargs["prompt_messages"]
+        return SimpleNamespace(message=SimpleNamespace(content="ok"), usage=None)
+
+    strat._session = SimpleNamespace(model=SimpleNamespace(llm=SimpleNamespace(invoke=capture)))
+    usage: dict = {"usage": None}
+    lock = threading.Lock()
+    history = [{"role": "user", "content": "上一轮问题"}]
+    plan_llm = strat._make_llm_caller({}, history=history, usage=usage, usage_lock=lock)
+    step_llm = strat._make_llm_caller({}, usage=usage, usage_lock=lock)
+    plan_llm("sys", "现在的问题")
+    plan_msgs = seen["messages"]
+    step_llm("sys", "现在的问题")
+    step_msgs = seen["messages"]
+    assert any(getattr(m, "content", None) == "上一轮问题" for m in plan_msgs), plan_msgs
+    assert not any(getattr(m, "content", None) == "上一轮问题" for m in step_msgs), step_msgs
+    assert plan_llm.usage is step_llm.usage is usage
 
     print("verify_tools_contract: OK")
     return 0

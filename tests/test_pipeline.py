@@ -6,6 +6,7 @@ from core.plan import Plan
 from core.planner import DEFAULT_PLANNING_PROMPT, Planner, extract_json, tools_description
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad
+from core.text import truncate_middle
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
 
 
@@ -275,3 +276,21 @@ class TestReplanner:
         r.replan(plan, plan.steps[0], "e", Scratchpad(), "g")
         with pytest.raises(BudgetExhaustedError):
             r.replan(plan, plan.steps[0], "e", Scratchpad(), "g")
+
+
+# ---------- truncate_middle ----------
+
+class TestTruncateMiddle:
+    def test_short_value_untouched(self):
+        assert truncate_middle("abc", 10) == "abc"
+        assert truncate_middle("abc", None) == "abc"
+
+    def test_long_value_keeps_both_ends(self):
+        text = "".join(str(i % 10) for i in range(1000))
+        out = truncate_middle(text, 100)
+        assert out.startswith(text[:50]) and out.endswith(text[-50:])
+        assert "已省略 900 字符" in out
+        assert len(out) < 100 + 40
+
+    def test_zero_or_negative_disables(self):
+        assert truncate_middle("abc", 0) == "abc"
