@@ -41,7 +41,7 @@ from core.planner import Planner
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad, validate_plan
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
-from core.text import truncate_middle
+from core.text import ThinkFilter, strip_think, truncate_middle
 from core.tool_allowlist import filter_allowed_tools
 
 FINAL_ANSWER_SYSTEM = (
@@ -62,6 +62,14 @@ ANSWER_VAR = "answer"
 # every workflow would just set it wrong. ponytail: hard-coded 600s ceiling
 # for a single tool/LLM step; lower it here if a workflow needs tighter.
 _STEP_TIMEOUT_SECONDS = 600
+
+# The daemon runs an invocation under PLUGIN_MAX_EXECUTION_TIMEOUT (600s) and
+# kills the whole SSE stream past it, throwing away every step result. The
+# default budget below stays under that so the plugin can answer with what it
+# has; _RESERVE_FINAL_ANSWER_SECONDS is left for that closing model call (when
+# less than that remains the accumulated results are returned as-is).
+_DEFAULT_EXECUTION_SECONDS = 480
+_RESERVE_FINAL_ANSWER_SECONDS = 60
 
 
 def _flatten_content(content: Any) -> str:
@@ -103,6 +111,7 @@ def _plan_with_validation(
     instruction: str,
     initial_vars: set[str],
     budget: int,
+    deadline: float | None = None,
 ) -> Plan:
     """Plan with a retry budget for invalid plans.
 
@@ -110,9 +119,14 @@ def _plan_with_validation(
     category-3 "规划层失败" exit and return an empty answer; the loop converts
     the same budget into re-plan attempts. Model-level errors re-raise and are
     labelled by the caller (they are not plan-quality issues).
+    Retries stop once ``deadline`` passes: another plan attempt on a slow model
+    costs minutes the invocation does not have.
     """
     last_error: InvalidPlanError | None = None
-    for _ in range(budget + 1):
+    for attempt in range(budget + 1):
+        if attempt and deadline is not None and time.monotonic() >= deadline:
+            assert last_error is not None
+            raise last_error
         try:
             plan = planner.plan(goal, tools, instruction, sorted(initial_vars))
             validate_plan(plan, initial_vars)
@@ -233,6 +247,10 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         # paste into the next prompt (a scraped page would otherwise dominate it).
         result_chars = to_int(parameters.get("max_result_chars"), 8000)
         result_limit = None if result_chars <= 0 else self._clamp(result_chars, 500, 200_000, 8000)
+        # 0 disables the budget (and with it the protection against the
+        # daemon's PLUGIN_MAX_EXECUTION_TIMEOUT killing the whole invocation).
+        budget_seconds = to_int(parameters.get("max_execution_seconds"), _DEFAULT_EXECUTION_SECONDS)
+        deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
 
         # Two funnels over one usage sink: planning and the final answer carry the
         # chat history, per-step calls do not (that would re-send the whole
@@ -278,7 +296,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         planner = Planner(llm=plan_llm, planning_prompt=planning_prompt, max_steps=max_steps)
         try:
             plan = _plan_with_validation(
-                planner, goal, tools, instruction, initial_vars, budget=max_invalid_plan
+                planner, goal, tools, instruction, initial_vars, budget=max_invalid_plan, deadline=deadline
             )
         except InvalidPlanError as e:
             yield self.create_text_message(f"[计划执行 Agent] 规划层失败：{e}\n")
@@ -310,7 +328,21 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                 max_parallel,
                 streamed,
                 max_result_chars=result_limit,
+                deadline=deadline,
             )
+
+            if outcome.timed_out:
+                yield from self._final_answer(
+                    plan_llm,
+                    goal,
+                    scratchpad,
+                    output_variable,
+                    context_items,
+                    usage,
+                    reason=f"执行时间预算（{budget_seconds} 秒）已用尽，剩余步骤已跳过",
+                    deadline=deadline,
+                )
+                return
 
             if outcome.completed:
                 break
@@ -320,8 +352,9 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
 
             # Category 2: step failure -> try replanning
             try:
-                yield self.create_text_message(
-                    f"⚠️ 步骤 {failed.id}「{failed.description}」失败：{outcome.error}，尝试重规划…\n"
+                yield self.create_log_message(
+                    PROGRESS_LABEL,
+                    {"warning": f"步骤 {failed.id}「{failed.description}」失败：{outcome.error}，尝试重规划"},
                 )
                 new_plan = replanner.replan(
                     original=current_plan,
@@ -347,7 +380,9 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
                         reason=f"重规划生成的计划无效：{e}",
                     )
                     return
-                yield self.create_text_message(f"⚠️ 重规划生成的计划无效（{e}），重试…\n")
+                yield self.create_log_message(
+                    PROGRESS_LABEL, {"warning": f"重规划生成的计划无效（{e}），重试"}
+                )
             except BudgetExhaustedError as e:
                 yield from self._final_answer(
                     plan_llm, goal, scratchpad, output_variable, context_items, usage, reason=str(e)
@@ -357,7 +392,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         # Success: emit the final variable's content. The plan's output_var names
         # are chosen by the model, so fall back to the last step's variable.
         final_var = output_variable if scratchpad.has(output_variable) else current_plan.steps[-1].output_var
-        final_text = str(scratchpad.get(final_var, ""))
+        final_text = strip_think(str(scratchpad.get(final_var, "")))
         if not streamed.get("answer"):
             yield self.create_text_message(final_text)
         yield from self._emit_tail(final_text, context_items, usage)
@@ -376,6 +411,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         max_parallel: int = 1,
         streamed: dict[str, bool] | None = None,
         max_result_chars: int | None = None,
+        deadline: float | None = None,
     ) -> Generator[AgentInvokeMessage, None, ExecutionOutcome]:
         """Run the executor on a worker thread while keeping the node stream alive.
 
@@ -392,10 +428,14 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         events: queue.Queue[tuple[str, Any] | None] = queue.Queue()
         outcome: list[ExecutionOutcome] = []
         failure: list[BaseException] = []
+        answer_filter = ThinkFilter()
 
         def on_token(text: str) -> None:
+            visible = answer_filter.feed(text)
+            if not visible:
+                return
             streamed["answer"] = True
-            events.put(("token", text))
+            events.put(("token", visible))
 
         def on_artifact(message: AgentInvokeMessage) -> None:
             events.put(("artifact", message))
@@ -413,6 +453,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             on_progress=lambda sid, done, total, desc: events.put(("step", f"步骤 {done}/{total}：{desc}")),
             max_parallel=max_parallel,
             step_timeout=_STEP_TIMEOUT_SECONDS,
+            deadline=deadline,
         )
 
         def work() -> None:
@@ -443,6 +484,10 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
             else:
                 yield self.create_log_message(PROGRESS_LABEL, {"progress": payload})
         worker.join()
+        tail = answer_filter.flush()
+        if tail:
+            streamed["answer"] = True
+            yield self.create_text_message(tail)
         if failure:
             raise failure[0]
         return outcome[0]
@@ -715,19 +760,36 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         context_items: Any,
         usage: dict[str, Any],
         reason: str,
+        deadline: float | None = None,
     ) -> Generator[AgentInvokeMessage]:
-        """Best-effort answer with an explicit failure notice (design doc §5.1)."""
+        """Best-effort answer with an explicit failure notice (design doc §5.1).
+
+        When ``deadline`` leaves less than the reserve, the closing model call is
+        skipped and the accumulated results are returned verbatim: something
+        beats an invocation the daemon kills mid-flight.
+        """
         state = scratchpad.variables()
         results = {k: v for k, v in state.items() if not k.endswith("_error")}
         errors = {k: v for k, v in state.items() if k.endswith("_error")}
         payload = json.dumps({"成果": results, "失败": errors}, ensure_ascii=False, default=str)
         yield self.create_text_message(f"❌ {reason}，以下为尽力回答：\n\n")
+        if deadline is not None and deadline - time.monotonic() < _RESERVE_FINAL_ANSWER_SECONDS:
+            digest = json.dumps(results, ensure_ascii=False, default=str) if results else "（无可用结果）"
+            yield self.create_text_message(digest)
+            scratchpad.set(output_variable, digest)
+            yield from self._emit_tail(digest, context_items, usage)
+            return
         answer = ""
+        answer_filter = ThinkFilter()
         for piece in llm.stream(
             FINAL_ANSWER_SYSTEM,
             f"目标：{goal}\n失败原因：{reason}\n已有成果：{payload}",
         ):
-            answer += piece
-            yield self.create_text_message(piece)
+            visible = answer_filter.feed(piece)
+            if visible:
+                answer += visible
+                yield self.create_text_message(visible)
+        answer += answer_filter.flush()
+        answer = strip_think(answer)
         scratchpad.set(output_variable, answer)
         yield from self._emit_tail(answer, context_items, usage)

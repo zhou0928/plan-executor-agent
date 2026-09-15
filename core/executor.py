@@ -12,6 +12,7 @@ sequential path stays the default because most plans are chains.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ class ExecutionOutcome:
     failed_step: Step | None = None
     error: str | None = None
     completed: bool = False  # True when all steps finished
+    timed_out: bool = False  # True when the wall-clock deadline stopped the run
 
 
 class Executor:
@@ -40,11 +42,22 @@ class Executor:
         on_progress: ProgressCallback | None = None,
         max_parallel: int = 1,
         step_timeout: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         self._pool = pool
         self._on_progress = on_progress
         self._max_parallel = max_parallel
         self._step_timeout = step_timeout
+        self._deadline = deadline
+
+    def _past_deadline(self) -> bool:
+        """Wall-clock budget check: stop *starting* work past the deadline.
+
+        Steps already running are left to finish (their results still count);
+        without this the plugin keeps working until the daemon kills the whole
+        invocation and every produced result is lost.
+        """
+        return self._deadline is not None and time.monotonic() >= self._deadline
 
     def run(self, plan: Plan, scratchpad: Scratchpad, start_index: int = 0) -> ExecutionOutcome:
         """Execute steps[start_index:]; returns what happened.
@@ -89,6 +102,8 @@ class Executor:
     def _run_sequential(self, steps: list[Step], scratchpad: Scratchpad) -> ExecutionOutcome:
         total = len(steps)
         for i, step in enumerate(steps):
+            if self._past_deadline():
+                return ExecutionOutcome(timed_out=True)
             if self._on_progress:
                 self._on_progress(step.id, i + 1, total, step.description)
             try:
@@ -105,6 +120,7 @@ class Executor:
         pending = list(steps)
         failure: list[ExecutionOutcome] = []
         counter = {"done": 0}
+        stopped = False
         lock = threading.Lock()
 
         def ready(step: Step) -> bool:
@@ -131,6 +147,9 @@ class Executor:
         with ThreadPoolExecutor(max_workers=self._max_parallel) as workers:
             running: dict[Future[None], Step] = {}
             while pending or running:
+                if pending and self._past_deadline():
+                    stopped = True
+                    pending.clear()  # in-flight steps still finish
                 for step in list(pending):
                     if failure:
                         break
@@ -140,6 +159,8 @@ class Executor:
                 if failure and not running:
                     break
                 if not running:
+                    if stopped:
+                        break
                     blocked = pending[0]
                     return ExecutionOutcome(
                         failed_step=blocked,
@@ -151,4 +172,6 @@ class Executor:
 
         if failure:
             return failure[0]
+        if stopped:
+            return ExecutionOutcome(timed_out=True)
         return ExecutionOutcome(completed=True)

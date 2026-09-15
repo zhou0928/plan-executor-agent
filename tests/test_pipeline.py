@@ -6,7 +6,7 @@ from core.plan import Plan
 from core.planner import DEFAULT_PLANNING_PROMPT, Planner, extract_json, tools_description
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad
-from core.text import truncate_middle
+from core.text import ThinkFilter, strip_think, truncate_middle
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
 
 
@@ -294,3 +294,50 @@ class TestTruncateMiddle:
 
     def test_zero_or_negative_disables(self):
         assert truncate_middle("abc", 0) == "abc"
+
+class TestStripThink:
+    def test_plain_text_untouched(self):
+        assert strip_think("正常回答") == "正常回答"
+
+    def test_answer_after_closed_block(self):
+        assert strip_think("<think>推理过程</think>答案") == "答案"
+
+    def test_unclosed_block_dropped(self):
+        assert strip_think("答案前<think>还没想完") == "答案前"
+
+    def test_empty(self):
+        assert strip_think("") == ""
+
+
+class TestThinkFilter:
+    def _drain(self, chunks):
+        f = ThinkFilter()
+        out = "".join(f.feed(c) for c in chunks)
+        return out + f.flush()
+
+    def test_single_chunk(self):
+        assert self._drain(["<think>推理</think>答案"]) == "答案"
+
+    def test_split_open_tag(self):
+        assert self._drain(["<thi", "nk>推理", "</think>答案"]) == "答案"
+
+    def test_split_close_tag(self):
+        assert self._drain(["<think>推理</thi", "nk>答案"]) == "答案"
+
+    def test_token_by_token(self):
+        text = "<think>先想想</think>最终答案"
+        assert self._drain(list(text)) == "最终答案"
+
+    def test_plain_text_streams_without_delay(self):
+        assert self._drain(["你好", "，世界"]) == "你好，世界"
+
+    def test_stray_close_drops_leading_reasoning(self):
+        assert self._drain(["推理中</think>答案"]) == "答案"
+
+    def test_unclosed_block_yields_nothing(self):
+        assert self._drain(["<think>没闭合"]) == ""
+
+    def test_flush_returns_held_partial_tag(self):
+        f = ThinkFilter()
+        assert f.feed("看这个<") == "看这个"
+        assert f.flush() == "<"

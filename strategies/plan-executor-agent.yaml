@@ -161,6 +161,18 @@ parameters:
       en_US: Tool/retrieval output longer than this is clipped, keeping both ends. 0 = no limit.
       zh_Hans: 工具或检索结果超过该长度会截断（保留头尾、中间省略），避免灌爆后续提示词。0 表示不限制。
       ja_JP: Clip long tool output (keeps both ends). 0 = no limit.
+  - name: max_execution_seconds
+    type: number
+    required: false
+    default: 480
+    label:
+      en_US: Max execution seconds
+      zh_Hans: 执行时间上限（秒）
+      ja_JP: Max execution seconds
+    help:
+      en_US: Stop starting new steps after this wall-clock budget and answer with what is done. Keep it below the daemon's PLUGIN_MAX_EXECUTION_TIMEOUT (600s default), which kills the whole run and loses every result. 0 = no limit.
+      zh_Hans: 超过该墙钟预算后不再开始新步骤，用已完成的结果作答。需低于插件守护进程的 PLUGIN_MAX_EXECUTION_TIMEOUT（默认 600 秒）——超过会被整轮杀掉、结果全丢。0 表示不限制。
+      ja_JP: Stop new steps after this budget and answer with partial results. Keep below PLUGIN_MAX_EXECUTION_TIMEOUT. 0 = no limit.
   - name: output_variable
     type: string
     required: false

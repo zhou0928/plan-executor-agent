@@ -55,8 +55,10 @@ class PromptCapturePool:
 
     def __init__(self, result: str) -> None:
         self.result = result
+        self.calls: list = []
 
     def execute(self, step, scratchpad, stream=False):
+        self.calls.append(step)
         return self.result
 
 
@@ -129,6 +131,42 @@ class TestExecutorTimeout:
         outcome = Executor(PromptCapturePool("ok"), step_timeout=0.1).run(make_plan(PLAN_1STEP), sp)
         assert outcome.completed
         assert sp.get("w") == "ok"
+
+
+# ---------- Executor: wall-clock deadline (daemon kills the run past its cap) ----------
+
+class TestExecutorDeadline:
+    def test_past_deadline_skips_every_step(self):
+        sp = Scratchpad({"city": "北京"})
+        pool = PromptCapturePool("ok")
+        outcome = Executor(pool, deadline=time.monotonic() - 1).run(make_plan(PLAN_1STEP), sp)
+        assert outcome.timed_out
+        assert not outcome.completed
+        assert not sp.has("w")
+        assert pool.calls == []  # no work started at all
+
+    def test_future_deadline_runs_normally(self):
+        sp = Scratchpad({"city": "北京"})
+        outcome = Executor(PromptCapturePool("ok"), deadline=time.monotonic() + 60).run(
+            make_plan(PLAN_1STEP), sp
+        )
+        assert outcome.completed
+        assert not outcome.timed_out
+        assert sp.get("w") == "ok"
+
+    def test_parallel_past_deadline_reports_timed_out(self):
+        sp = Scratchpad()
+        plan = make_plan(
+            '{"steps": ['
+            '{"id": 1, "description": "甲", "tool": "ta", "input_mapping": {}, "output_var": "a"},'
+            '{"id": 2, "description": "乙", "tool": "tb", "input_mapping": {}, "output_var": "b"}'
+            "]}"
+        )
+        outcome = Executor(
+            PromptCapturePool("ok"), max_parallel=4, deadline=time.monotonic() - 1
+        ).run(plan, sp)
+        assert outcome.timed_out
+        assert not sp.has("a") and not sp.has("b")
 
 
 # ---------- to_int ----------
@@ -208,6 +246,26 @@ class TestPlanWithValidation:
         plan = mod._plan_with_validation(Planner(llm=llm), "目标", [], "", set(), budget=2)
         assert len(plan.steps) == 1
         assert calls["n"] == 2, "one invalid plan + one retry"
+
+    def test_past_deadline_stops_retrying(self):
+        mod = _load_strategy()
+        calls = {"n": 0}
+
+        def llm(system, user):
+            calls["n"] += 1
+            return INVALID_PLAN
+
+        with pytest.raises(InvalidPlanError):
+            mod._plan_with_validation(
+                Planner(llm=llm),
+                "目标",
+                [],
+                "",
+                set(),
+                budget=5,
+                deadline=time.monotonic() - 1,
+            )
+        assert calls["n"] == 1, "first attempt always runs, none after the deadline"
 
     def test_exhausts_budget_and_raises(self):
         mod = _load_strategy()
