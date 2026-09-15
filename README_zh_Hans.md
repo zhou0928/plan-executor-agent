@@ -1,7 +1,7 @@
 ## plan-executor-agent
 
 **作者：** xiaozhou
-**版本：** 0.2.0
+**版本：** 0.2.1
 **类型：** agent-strategy
 
 ### 简介

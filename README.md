@@ -1,73 +1,58 @@
 ## plan-executor-agent
 
-**Author:** xiaozhou
-**Version:** 0.2.0
-**Type:** agent-strategy
+**作者：** xiaozhou
+**版本：** 0.2.1
+**类型：** agent-strategy
 
-### Description
+### 简介
 
-A **Plan-and-Execute** agent strategy for Dify. The model first produces a
-structured step-by-step plan, then executes each step with tool awareness.
-When a step fails or the result diverges from the plan, the strategy
-automatically replans. Supports streaming, parallel step execution, file
-inputs, and execution metadata reporting.
+面向 Dify 的 **Plan-and-Execute（先规划再执行）** Agent 策略。模型先生成结构化的分步骤计划，再以工具感知的方式逐步执行。步骤失败或结果偏离计划时自动重规划。支持流式输出、并行步骤执行、文件输入和执行元数据上报。
 
-### Features
+### 功能特性
 
-- **Plan first, execute after**: the model generates a structured plan before
-  calling any tool
-- **Tool awareness**: the executor only uses the tools available in the node
-  and matching the `allowed_tools` allowlist
-- **Replanning**: on plan failure or tool error, the strategy replans up to
-  `max_replan` times (invalid plans draw from a separate budget)
-- **Streaming**: intermediate plans, step results, and the final answer are
-  streamed back to the workflow
-- **Parallel execution**: set `max_parallel_steps` to run independent steps in
-  parallel (default: 1, sequential)
-- **File inputs**: pass image files through the `files` parameter; they are
-  attached to every LLM call
-- **Execution metadata**: token usage is accumulated and reported to the Dify
-  usage panel
+- **先规划后执行**：调用任何工具之前，模型先生成结构化计划
+- **工具感知**：执行器只使用节点中可用、且匹配 `allowed_tools` 白名单的工具
+- **自动重规划**：计划执行失败或工具报错时，最多重规划 `max_replan` 次（非法计划独立预算）
+- **失败归一化**：工具调用异常、推理 LLM 失败统一转为步骤错误并触发重规划；规划层失败（模型不可用等）则优雅退出并返回尾单
+- **流式输出**：中间计划、步骤结果、最终答案均实时流式返回
+- **并行执行**：设置 `max_parallel_steps` 可并行执行相互独立的步骤（默认 1，串行）
+- **文件输入**：通过 `files` 参数传入图片，附加到每次 LLM 调用
+- **执行元数据**：token 用量累计并上报到 Dify 用量面板
 
-### Setup
+### 安装
 
-1. Install the plugin in your Dify workspace (Agent strategies section).
-2. Add the Chatflow / Workflow **Agent** node and choose **Plan-Executor Agent**.
+1. 在 Dify 工作区安装插件（Agent 策略分类）。
+2. 在 Chatflow / Workflow 中添加 **Agent** 节点，选择 **Plan-Executor Agent**。
 
-### Parameters
+### 参数说明
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `model` | LLM provider and model used for planning and execution | — |
-| `query` | User query to answer | — |
-| `tools` | Tools available to the executor | — |
-| `allowed_tools` | Optional comma-separated allowlist of tool names | all |
-| `context` | Extra context appended to the user message | — |
-| `files` | Optional image files attached to every LLM call | — |
-| `instruction` | Optional extra instructions appended to the planning prompt | — |
-| `max_steps` | Maximum number of steps per plan | 5 |
-| `max_replan` | Maximum replans on valid-but-failed plans | 2 |
-| `max_invalid_plan` | Maximum replans on invalid plans (separate budget) | 2 |
-| `max_parallel_steps` | Parallelism for independent steps (1 = sequential) | 1 |
-| `planning_prompt` | Optional custom planning prompt override | default |
-| `output_variable` | Name of the workflow variable holding the answer | `answer` |
-| `verbose` | Stream intermediate plans and step details | false |
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `model` | 规划与执行使用的 LLM 供应商及模型 | — |
+| `query` | 用户问题 | — |
+| `tools` | 可供执行器使用的工具 | — |
+| `allowed_tools` | 可选，逗号分隔的工具名称白名单 | 全部 |
+| `context` | 追加到用户消息中的额外上下文 | — |
+| `files` | 可选，附加到每次 LLM 调用的图片文件 | — |
+| `instruction` | 可选，追加到规划提示词中的额外指令 | — |
+| `max_steps` | 每个计划的最大步骤数 | 5 |
+| `max_replan` | 计划有效但执行失败时的最大重规划次数 | 2 |
+| `max_invalid_plan` | 计划非法时的最大重规划次数（独立预算） | 2 |
+| `max_parallel_steps` | 独立步骤并行度（1 为串行） | 1 |
+| `planning_prompt` | 可选，自定义规划提示词 | 默认 |
+| `output_variable` | 保存答案的工作流变量名 | `answer` |
+| `verbose` | 是否流式输出中间计划与步骤详情 | 否 |
 
-### Usage Example
+### 使用示例
 
-A query like "Compare quarterly revenue trends across regions" produces a
-plan such as:
+例如问题 "对比各地区季度营收趋势" 会生成类似计划：
 
-1. Gather revenue data per region
-2. Aggregate by quarter
-3. Compare trends and summarize
+1. 获取各地区营收数据
+2. 按季度聚合
+3. 对比趋势并总结
 
-Each step runs with the available tools; failures trigger replanning instead
-of stopping. The final answer is emitted into `output_variable` (default
-`answer`).
+每个步骤使用可用工具执行；失败时触发重规划而非直接停止。最终答案输出到 `output_variable`（默认 `answer`）。
 
-### Privacy
+### 隐私
 
-See [PRIVACY.md](./PRIVACY.md). This plugin does not collect personal data and
-only forwards your query, context, tools, and files to the LLM model selected
-in the node.
+详见 [PRIVACY.md](./PRIVACY.md)。本插件不收集个人数据，仅将你的问题、上下文、工具与文件转发给节点中选定的 LLM 模型。
