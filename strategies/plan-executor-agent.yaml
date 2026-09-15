@@ -1,0 +1,184 @@
+identity:
+  name: plan-executor-agent
+  author: xiaozhou
+  label:
+    en_US: "Plan-Executor Agent"
+    zh_Hans: "计划执行 Agent"
+    ja_JP: "Plan-Executor Agent"
+  icon: icon.svg
+description:
+  en_US: "Plan-and-Execute agent strategy: plans first, executes step by step with tool awareness, replans on failure"
+  zh_Hans: "先规划再执行的 Agent 策略：先生成结构化计划，逐步带工具感知执行，失败时自动重规划"
+  ja_JP: "Plan-and-Execute agent strategy"
+features:
+  - history-messages
+parameters:
+  - name: model
+    type: model-selector
+    scope: tool-call&llm
+    required: true
+    label:
+      en_US: Model
+      zh_Hans: 模型
+      ja_JP: モデル
+  - name: query
+    type: string
+    required: true
+    label:
+      en_US: Query
+      zh_Hans: 查询
+      ja_JP: クエリ
+    help:
+      en_US: The user goal this agent plans for
+      zh_Hans: 用户目标，规划与执行的输入
+      ja_JP: The user goal
+  - name: tools
+    type: array[tools]
+    required: false
+    label:
+      en_US: Tools list
+      zh_Hans: 工具列表
+      ja_JP: ツールリスト
+  - name: allowed_tools
+    type: any
+    scope: array[string]
+    required: false
+    label:
+      en_US: Allowed tools
+      zh_Hans: 允许的工具
+      ja_JP: 許可ツール
+    help:
+      en_US: Optional. If filled, only these tool names are exposed to the planner. Empty = all attached tools.
+      zh_Hans: 可选。填写工具名则只有这些工具暴露给规划器；留空表示全部已挂载工具。
+      ja_JP: Optional. Empty means all attached tools.
+  - name: context
+    type: any
+    scope: array[object]
+    required: false
+    label:
+      en_US: Context
+      zh_Hans: 上下文
+      ja_JP: コンテキスト
+    help:
+      en_US: Optional. Knowledge retrieval results (bind a Knowledge Retrieval node output).
+      zh_Hans: 可选。知识库检索结果，可绑定「知识检索」节点的输出；会注入每次模型调用并在末尾展示引用。
+      ja_JP: Optional. Knowledge retrieval results.
+  - name: files
+    type: any
+    scope: array[file]
+    required: false
+    label:
+      en_US: Current-turn files
+      zh_Hans: 当前轮文件
+      ja_JP: 現在のターンのファイル
+    help:
+      en_US: Optional. Images uploaded this turn are attached to every model call.
+      zh_Hans: 可选。当前轮上传的图片会随每次模型调用一起发送（仅图片生效）。
+      ja_JP: Optional. Current-turn images.
+  - name: instruction
+    type: string
+    required: false
+    label:
+      en_US: Instruction
+      zh_Hans: 补充指令
+      ja_JP: Instruction
+    auto_generate:
+      type: prompt_instruction
+    template:
+      enabled: true
+    help:
+      en_US: Extra instructions for the agent, e.g. answer style or constraints
+      zh_Hans: 对 Agent 的额外要求，如回答风格、约束条件
+      ja_JP: Extra instructions
+  - name: max_steps
+    type: number
+    required: false
+    default: 20
+    label:
+      en_US: Max plan steps
+      zh_Hans: 计划步骤上限
+      ja_JP: Max steps
+    help:
+      en_US: Maximum number of steps in a plan (10-50)
+      zh_Hans: 单个计划允许的最大步骤数（10-50）
+      ja_JP: Max steps in a plan
+  - name: max_replan
+    type: number
+    required: false
+    default: 3
+    label:
+      en_US: Max replans
+      zh_Hans: 重规划上限
+      ja_JP: Max replans
+    help:
+      en_US: How many times the agent may replan after failures (0-10)
+      zh_Hans: 失败后允许重规划的次数（0-10），耗尽后尽力作答
+      ja_JP: Max replan attempts
+  - name: max_invalid_plan
+    type: number
+    required: false
+    default: 2
+    label:
+      en_US: Max invalid-plan retries
+      zh_Hans: 无效计划重试上限
+      ja_JP: Max invalid-plan retries
+    help:
+      en_US: Separate budget for replans whose output could not be parsed (0-10). Does not consume Max replans.
+      zh_Hans: 独立预算：重规划产出无法解析时的重试次数（0-10），不占用「重规划上限」的配额。
+      ja_JP: Max invalid-plan retries.
+  - name: max_parallel_steps
+    type: number
+    required: false
+    default: 1
+    label:
+      en_US: Max parallel steps
+      zh_Hans: 并发步骤数
+      ja_JP: 並列ステップ数
+    help:
+      en_US: Steps with no dependency between them run concurrently (1-8). 1 = sequential.
+      zh_Hans: 无依赖关系的步骤并发执行（1-8）。1 表示串行，也是默认值。
+      ja_JP: Max parallel steps (1-8).
+  - name: planning_prompt
+    type: string
+    required: false
+    label:
+      en_US: Planning prompt override
+      zh_Hans: 规划提示词覆盖
+      ja_JP: Planning prompt
+    help:
+      en_US: Leave empty to use the built-in Chinese planning prompt
+      zh_Hans: 留空使用内置中文规划提示词；填写则完全替换
+      ja_JP: Override planning prompt
+  - name: output_variable
+    type: string
+    required: false
+    default: output
+    label:
+      en_US: Output variable
+      zh_Hans: 输出变量名
+      ja_JP: Output variable
+    help:
+      en_US: Variable name holding the final answer, e.g. "output"
+      zh_Hans: 最终答案写入的变量名，如 output
+      ja_JP: Final answer variable name
+  - name: verbose
+    type: boolean
+    required: false
+    default: false
+    label:
+      en_US: Verbose
+      zh_Hans: 输出过程详情
+      ja_JP: Verbose
+    help:
+      en_US: Stream intermediate plans and step details
+      zh_Hans: 过程中流式输出中间计划与每步详情
+      ja_JP: Stream intermediate details
+output_schema:
+  type: object
+  properties:
+    answer:
+      type: string
+      description: Final answer produced by the plan execution
+extra:
+  python:
+    source: strategies/plan-executor-agent.py

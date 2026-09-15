@@ -1,0 +1,17 @@
+identity:
+  author: xiaozhou
+  name: plan-executor-agent
+  label:
+    en_US: "Plan-Executor Agent"
+    zh_Hans: "计划执行 Agent"
+    ja_JP: "計画実行エージェント"
+  description:
+    en_US: "Plan-and-Execute agent strategy: plans first, executes step by step with tool awareness, replans on failure"
+    zh_Hans: "先规划再执行的 Agent 策略：先生成结构化计划，逐步带工具感知执行，失败时自动重规划"
+    ja_JP: "Plan-and-Execute agent strategy"
+  icon: icon.svg
+strategies:
+  - strategies/plan-executor-agent.yaml
+extra:
+  python:
+    source: provider/plan-executor-agent.py

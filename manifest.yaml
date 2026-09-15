@@ -1,0 +1,40 @@
+version: 0.2.1
+type: plugin
+author: xiaozhou
+name: plan-executor-agent
+label:
+  en_US: Plan-Executor Agent
+  ja_JP: 計画実行エージェント
+  zh_Hans: 计划执行 Agent
+  pt_BR: Agente Plan-Executor
+description:
+  en_US: Plan-and-Execute agent strategy with tool awareness and replanning
+  ja_JP: Plan-and-Execute agent strategy with tool awareness and replanning
+  zh_Hans: Plan-and-Execute agent strategy with tool awareness and replanning
+  pt_BR: Plan-and-Execute agent strategy with tool awareness and replanning
+icon: _assets/icon.svg
+icon_dark: _assets/icon-dark.svg
+resource:
+  memory: 268435456
+  permission:
+    tool:
+      enabled: true
+    model:
+      enabled: true
+      llm: true
+plugins:
+  agent_strategies:
+    - provider/plan-executor-agent.yaml
+meta:
+  version: 0.2.1
+  arch:
+    - amd64
+    - arm64
+  runner:
+    language: python
+    version: "3.12"
+    entrypoint: main
+  minimum_dify_version: null
+created_at: 2026-09-14T09:13:29.57709+08:00
+privacy: PRIVACY.md
+verified: false
