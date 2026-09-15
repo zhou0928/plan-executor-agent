@@ -10,7 +10,7 @@ label:
 description:
   en_US: Plan-and-Execute agent strategy with tool awareness and replanning
   ja_JP: ツール認識と再プランニングを備えた Plan-and-Execute エージェント戦略
-  zh_Hans: 具备工具感知与自动重规划能力的 Plan-and-Execute（先规划再执行）Agent 策略
+  zh_Hans: Plan-and-Execute 先规划再执行策略：先生成结构化分步计划，再带工具感知逐步执行；步骤失败或偏离计划时自动重规划，支持流式输出、并行步骤执行、文件输入与执行元数据上报
   pt_BR: Estratégia de agente Plan-and-Execute com percepção de ferramentas e replanejamento
 icon: icon.svg
 icon_dark: icon-dark.svg
