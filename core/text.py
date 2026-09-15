@@ -94,3 +94,16 @@ def truncate_middle(text: str, limit: int | None) -> str:
     if dropped <= 0:
         return text
     return f"{text[:keep]}\n…[已省略 {dropped} 字符]…\n{text[-keep:]}"
+
+
+def render_partial(results: dict[str, object], skip: set[str] | None = None) -> str:
+    """Render the values a stopped run did produce, skipping bookkeeping vars.
+
+    The scratchpad always carries the inputs (``query``); printing the raw JSON
+    of everything makes an unfinished run look like it returned a request echo.
+    """
+    skip = skip or set()
+    done = {k: v for k, v in results.items() if k not in skip}
+    if not done:
+        return "（时间预算内未完成任何步骤）"
+    return "\n\n".join(f"【{k}】\n{v}" for k, v in done.items())

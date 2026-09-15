@@ -42,7 +42,7 @@ from core.planner import Planner
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad, validate_plan
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
-from core.text import ThinkFilter, strip_think, truncate_middle
+from core.text import ThinkFilter, render_partial, strip_think, truncate_middle
 from core.tool_allowlist import filter_allowed_tools
 
 FINAL_ANSWER_SYSTEM = (
@@ -801,7 +801,7 @@ class PlanExecutorAgentAgentStrategy(AgentStrategy):
         payload = json.dumps({"成果": results, "失败": errors}, ensure_ascii=False, default=str)
         yield self.create_text_message(f"❌ {reason}，以下为尽力回答：\n\n")
         if deadline is not None and deadline - time.monotonic() < _RESERVE_FINAL_ANSWER_SECONDS:
-            digest = json.dumps(results, ensure_ascii=False, default=str) if results else "（无可用结果）"
+            digest = render_partial(results, skip={"query"})
             yield self.create_text_message(digest)
             scratchpad.set(output_variable, digest)
             yield from self._emit_tail(digest, context_items, usage)

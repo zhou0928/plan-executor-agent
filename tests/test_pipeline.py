@@ -9,7 +9,7 @@ from core.plan import Plan
 from core.planner import DEFAULT_PLANNING_PROMPT, Planner, extract_json, tools_description
 from core.replanner import BudgetExhaustedError, Replanner
 from core.scratchpad import Scratchpad
-from core.text import ThinkFilter, strip_think, truncate_middle
+from core.text import ThinkFilter, render_partial, strip_think, truncate_middle
 from core.subagent_pool import LocalStepExecutor, StepExecutionError
 
 
@@ -382,3 +382,12 @@ class TestBoundedCaller:
     def test_budget_applies_to_the_call(self):
         with pytest.raises(BudgetTimeout):
             BoundedCaller(lambda s, u: time.sleep(5), time.monotonic() + 0.15)("sys", "usr")
+
+class TestRenderPartial:
+    def test_only_bookkeeping_vars_yields_a_notice(self):
+        assert render_partial({"query": "画个图"}, skip={"query"}) == "（时间预算内未完成任何步骤）"
+
+    def test_step_values_render_readably(self):
+        text = render_partial({"query": "q", "step_1": "人工智能", "step_2": "机器学习"}, skip={"query"})
+        assert text == "【step_1】\n人工智能\n\n【step_2】\n机器学习"
+        assert "{" not in text, "no raw JSON in the answer"
